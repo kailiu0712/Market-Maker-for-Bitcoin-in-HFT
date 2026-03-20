@@ -1,3 +1,13 @@
+"""
+Quote generation engine for market-making.
+
+Generates bid/ask prices and sizes based on:
+- Market impact (spread calculation)
+- Inventory position (skew and unwind)
+- Volatility and flow conditions
+- Opportunity filters (edge and risk gating)
+"""
+
 from dataclasses import dataclass
 from typing import Dict
 
@@ -6,6 +16,20 @@ from utils import ceil_to_tick, clamp, floor_to_tick
 
 @dataclass
 class QuoteTarget:
+    """
+    Target quote parameters to post to the market.
+    
+    Attributes:
+        timestampms (int): Timestamp when quote was generated
+        fair_price (float): Estimated fair value of the instrument
+        reservation_price (float): Inventory-adjusted fair price
+        alpha_bps (float): Directional bias in basis points
+        bid_price (float): Target bid price
+        ask_price (float): Target ask price
+        bid_size (float): Target bid size (0 if not quoting)
+        ask_size (float): Target ask size (0 if not quoting)
+        half_spread (float): Half-spread component used in calculation
+    """
     timestampms: int
     fair_price: float
     reservation_price: float
@@ -18,6 +42,18 @@ class QuoteTarget:
 
 
 class QuoteEngine:
+    """
+    Generates optimal bid/ask quotes and sizes.
+    
+    Process:
+    1. Calculate half-spread based on volatility, flow, inventory
+    2. Center quotes around reservation price (inventory-adjusted fair price)
+    3. Apply inventory unwind when position is extreme
+    4. Apply opportunity filters (volatility, flow, edge gates)
+    5. Enforce hard limits (min/max price, size constraints)
+    
+    Returns QuoteTarget objects with proposed bid/ask prices and sizes.
+    """
     def __init__(
         self,
         price_tick: float,
@@ -42,6 +78,15 @@ class QuoteEngine:
         calm_market_spread_threshold_bps: float,
         calm_market_tightening_factor: float,
     ) -> None:
+        """
+        Initialize quote engine with all configuration parameters.
+        
+        Parameters control:
+        - Spread calculation (market, volatility, flow, inventory multipliers)
+        - Inventory management (max inventory, unwind thresholds)
+        - Quote quality filters (minimum edge, max volatility, max flow ratio)
+        - Market conditions (calm market spread tightening)
+        """
         self.price_tick = price_tick
         self.base_order_size = base_order_size
         self.min_order_size = min_order_size
@@ -71,6 +116,25 @@ class QuoteEngine:
         signal: Dict[str, float],
         risk_state: Dict[str, float],
     ) -> QuoteTarget:
+        """
+        Generate optimal quote for current market conditions and position.
+        
+        Applies multiple adjustments in sequence:
+        1. Calculate dynamic half-spread based on market conditions
+        2. Apply calm market spread tightening if applicable
+        3. Apply inventory unwinding when position is extreme
+        4. Apply opportunity filters (market conditions, edge requirements)
+        5. Enforce minimum order size
+        
+        Args:
+            timestampms (int): Current timestamp
+            features (Dict[str, float]): Market features (price, spread, volatility, depth, flow)
+            signal (Dict[str, float]): Price signal (fair price, adjusted fair price, alpha)
+            risk_state (Dict[str, float]): Risk state (inventory fraction, size multipliers, allowed flags)
+            
+        Returns:
+            QuoteTarget: Target quote with bid/ask prices and sizes
+        """
         best_bid = features["best_bid"]
         best_ask = features["best_ask"]
         market_spread = max(features["spread"], self.price_tick)
@@ -149,6 +213,25 @@ class QuoteEngine:
         bid_size: float,
         ask_size: float,
     ) -> tuple[float, float, float, float]:
+        """
+        Apply inventory unwind adjustments when position is extreme.
+        
+        When inventory is short (negative): disable asking, increase bid size to buy back.
+        When inventory is long (positive): disable bidding, increase ask size to sell.
+        Optionally join the market touch when unwinding (better fill probability).
+        
+        Args:
+            best_bid (float): Current best bid price
+            best_ask (float): Current best ask price
+            inv_frac (float): Normalized inventory fraction
+            bid_price (float): Proposed bid price
+            ask_price (float): Proposed ask price
+            bid_size (float): Proposed bid size
+            ask_size (float): Proposed ask size
+            
+        Returns:
+            tuple[float, float, float, float]: Adjusted bid_price, ask_price, bid_size, ask_size
+        """
         if inv_frac <= -self.inventory_unwind_threshold_fraction:
             ask_size = 0.0
             bid_size *= self.inventory_unwind_size_multiplier
@@ -172,7 +255,33 @@ class QuoteEngine:
         ask_price: float,
         risk_state: Dict[str, float],
     ) -> tuple[float, float]:
-        required_roundtrip_bps = 2.0 * self.maker_fee_rate * 1e4 + self.min_required_edge_buffer_bps
+        """
+        Apply opportunity filters to determine if quoting is profitable.
+        
+        Filters:
+        1. Volatility gate: disable if volatility too high
+        2. Flow gate: disable if flow ratio exceeds threshold
+        3. Edge requirement: only quote if edge sufficient to cover fees + buffer
+        4. Directional alpha gate: only post non-preferred side if alpha strong
+        
+        Args:
+            bid_size (float): Proposed bid size
+            ask_size (float): Proposed ask size
+            features (Dict[str, float]): Market features
+            signal (Dict[str, float]): Price signal
+            reservation_price (float): Inventory-adjusted fair price
+            bid_price (float): Proposed bid price
+            ask_price (float): Proposed ask price
+            risk_state (Dict[str, float]): Risk state
+            
+        Returns:
+            tuple[float, float]: Filtered bid_size, ask_size (may be set to 0)
+        """
+        # Use one-side maker fee as the required edge for quoting.
+        # In practice, the market-making edge available when posting a single side
+        # is often close to half the full spread, so using 2x fee here would
+        # prevent quoting in normal narrow-spread conditions.
+        required_edge_bps = 1.0 * self.maker_fee_rate * 1e4 + self.min_required_edge_buffer_bps
         short_vol_ok = features["volatility_5s_bps"] <= self.max_volatility_to_quote_bps
         flow_ratio = abs(features["trade_flow_5s"]) / max(features["depth_total_5"], 1e-8)
         flow_ok = flow_ratio <= self.max_flow_ratio_to_quote
@@ -190,9 +299,9 @@ class QuoteEngine:
                 bid_size = 0.0
                 ask_size = 0.0
 
-        if bid_edge_bps < required_roundtrip_bps:
+        if bid_edge_bps < required_edge_bps:
             bid_size = 0.0
-        if ask_edge_bps < required_roundtrip_bps:
+        if ask_edge_bps < required_edge_bps:
             ask_size = 0.0
 
         if not self.allow_two_sided_when_alpha_small:

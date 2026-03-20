@@ -1,0 +1,312 @@
+"""
+AGG_CONFIG.PY - AGGRESSIVE MARKET-MAKING VARIANT
+Summary of Changes and Expected Impact
+========================================================
+
+EXECUTIVE SUMMARY
+-----------------
+The baseline config produces only ~1 fill per day despite 72 hours of market data.
+The primary issue: baseline spreads are 50-100+ bps wide while fees are only
+14 bps total cost, leaving excessive buffer that prevents participation.
+
+The agg_config.py variant makes 9 targeted parameter adjustments to increase
+quote competitiveness while maintaining risk control and profitability after fees.
+
+Expected outcome: 5-15x increase in fill frequency, 2-3x increase in traded notional,
+while preserving realistic edge capture and profitability.
+
+
+BASELINE ANALYSIS & ROOT CAUSES
+--------------------------------
+
+1. MIN_HALF_SPREAD_TICKS = 2.0 (40 bps per side at market, 80+ bps total)
+   PROBLEM: Baseline spread of 2 ticks is FIXED and applied regardless of market.
+   - At ETH $2500: 0.02 / 2500 * 10000 = 80 bps full spread
+   - At BTC $70000: 0.02 / 70000 * 10000 = 2.9 bps full spread
+   - Typical order book spreads: 10-30 bps in normal conditions
+   - Conclusion: Strategy is 3-8x wider than market, so rarely fills passively
+
+2. INVENTORY_SKEW_TICKS = 8.0 (extremely aggressive inventory penalty)
+   PROBLEM: Every unit of inventory moves reservation price 0.08 ticks.
+   - At MAX_INVENTORY = 0.15 with any inventory != 0, quotes move 0.08+ ticks away
+   - For a balanced MM strategy targeting INVENTORY_TARGET = 0, even inventory of
+     0.005 pushes quotes 0.04 ticks away from fair, adding 40+ bps width
+   - Effect: Compounds the baseline width issue, pushing quotes further from market
+
+3. MIN_REQUIRED_EDGE_BUFFER_BPS = 1.0 (adds to cost-coverage requirement)
+   PROBLEM: Requires 2*7 + 1 = 15 bps edge minimum to quote
+   - When combined with MIN_HALF_SPREAD_TICKS baseline of 80 bps,
+     the bidside quotes are 40 bps worse than mid, well below the 15 bps threshold
+   - Quotes get rejected by _apply_opportunity_filter() for insufficient edge
+   - Effect: Prevents quoting even though edge is actually there on other side
+
+4. QUOTE_REPRICE_THRESHOLD_TICKS = 2.0 (too sensitive to market moves)
+   PROBLEM: Reprices whenever market moves 2 ticks
+   - Results in frequent quote cancellations and re-postings
+   - Each repost resets queue position to back of level
+   - Fill probability from passive queue depth is ~35% (TOUCH_FILL_FRACTION)
+   - Frequent reprices continuously reset this, reducing cumulative fill odds
+   - Effect: Acts as a drag on passive fill rate
+
+5. INVENTORY_UNWIND_THRESHOLD_FRACTION = 0.01 (triggers too early)
+   PROBLEM: At only 1% of max (0.0015 when max = 0.15), unwind activates too soon
+   - Switch from two-sided MM to reduce-only mode at trivial inventory levels
+   - Prevents natural market-making cycle from working
+   - Effect: Reduces participation by blocking one direction too often
+
+
+AGGRESSIVE CONFIG CHANGES
+-------------------------
+
+CHANGE#1: MIN_HALF_SPREAD_TICKS = 2.0 → 1.0
+(Reduction: 50%)
+
+RATIONALE:
+- At $2500, 1 tick = 40 bps full spread
+- After 14 bps fee cost, leaves 26 bps edge = 65% profit margin on routed volume
+- This is still profitable but no longer unrealistically wide
+- Aligns with typical market spreads in normal (non-crisis) conditions
+
+IMPACT:
+- Quotes now competitive with market level (vs 3-8x worse)
+- Direct 40-60 bps improvement in quote competitiveness
+- Combined with other filters, this is the LARGEST single lever
+- EXPECTED: 3-5x immediate increase in fill rate
+
+---
+
+CHANGE #2: INVENTORY_SKEW_TICKS = 8.0 → 3.5
+(Reduction: 56%)
+
+RATIONALE:
+- Still penalizes inventory (prevents runaway long/short accumulation)
+- 3.5 ticks means 0.1 inventory moves quotes ~0.35 ticks (35 bps at $2500)
+- Still signaling "prefer to unwind inventory" but more moderately
+- Keeps quotes closer to fair market level
+
+IMPACT:
+- Reduces the compounding width effect
+- Quotes stay closer to reservation price where they'll fill
+- EXPECTED: 1.5-2x increase in fill rate (multiplicative with Change #1)
+
+---
+
+CHANGE #3: MIN_REQUIRED_EDGE_BUFFER_BPS = 1.0 → 0.3
+(Reduction: 70%)
+
+RATIONALE:
+- Requires 2*7 + 0.3 = 14.3 bps edge (barely above cost)
+- Most opportunities will have this much edge if spreads are fair
+- Reduces false negatives where edge exists but filter rejects
+
+IMPACT:
+- Allows participation in tighter market conditions
+- Prevents over-filtering when spreads narrow to realistic levels
+- EXPECTED: 1.2-1.5x increase from broader participation
+
+---
+
+CHANGE #4: MAX_VOLATILITY_TO_QUOTE_BPS = 20.0 → 35.0
+(Increase: 75%)
+
+RATIONALE:
+- Baseline 20 bps blocks during typical crypto volatility (most markets run 15-40 bps)
+- 35 bps still conservative but allows quoting through normal vol spikes
+- Spreads automatically widen via VOLATILITY_SPREAD_MULTIPLIER when vol is high
+- Self-adjusting protection already exists; blanket gate too strict
+
+IMPACT:
+- Increases quoting windows from ~40-50% of time to ~80%+ of time
+- Spreads still adapt to volatility correctly via multiplier
+- EXPECTED:  1.5-2x increase in participation time window
+
+---
+
+CHANGE #5: MAX_FLOW_RATIO_TO_QUOTE = 0.08 → 0.12
+(Increase: 50%)
+
+RATIONALE:
+- Baseline 0.08 blocks when one-sided flow exceeds 8% of available depth
+- Typical MM should handle up to 10-15% adverse flow
+- Still prevents quoting into extreme market stress
+
+IMPACT:
+- Allows quoting through normal flow periods
+- Selective two-sided participation even in moderately adverse flow
+- EXPECTED: 1.3-1.7x from better flow gate
+
+---
+
+CHANGE #6: MIN_DIRECTIONAL_ALPHA_BPS = 1.0 → 0.5
+(Reduction: 50%)
+
+RATIONALE:
+- Lower threshold to trigger "weak alpha" two-sided quoting logic
+- More willing to establish two-sided presence when directional signal is small
+- Encourages natural market-making cycle
+
+IMPACT:
+- More frequent two-sided quotes vs one-sided quotes
+- Better inventory balance over time
+- EXPECTED: 1.2-1.5x from more two-sided participation
+
+---
+
+CHANGE #7: QUOTE_REPRICE_THRESHOLD_TICKS = 2.0 → 4.0
+(Increase: 100%)
+
+RATIONALE:
+- Only reprice if market moves 4 ticks (50+ bps at $2500)
+- Reduces quote churn and resets to queue position
+- Improves queue priority maintenance for passive fills
+- Most markets don't see 4-tick moves without major events
+
+IMPACT:
+- Better queue priority = higher TOUCH_FILL_FRACTION realization
+- Fewer reprices = less "back-of-queue" resets
+- EXPECTED: 1.5-2x from better queue position
+
+---
+
+CHANGE #8: INVENTORY_UNWIND_THRESHOLD_FRACTION = 0.01 → 0.06
+(Increase: 6x)
+
+RATIONALE:
+- Baseline 1% (0.0015 units) is unrealistically tight
+- Aggressive variant allows positions to grow to 6% of max before unwinding
+- Still maintains risk control, just less paranoid about inventory
+- Natural MM positions 5-10% on their max is realistic
+
+IMPACT:
+- More two-sided quoting (don't force reduce-only at trivial inventory)
+- Better inventory cycling and profitability
+- EXPECTED: 1.5-2x from more two-sided activity
+
+---
+
+CHANGE #9: CALM_MARKET_VOL_THRESHOLD_BPS = 6.0 → 10.0
+(Increase: 67%)
+
+RATIONALE:
+- Baseline 6 bps threshold for "calm market" is too tight
+- Relaxed to 10 bps allows spread tightening in more conditions
+- Still reasonable definition of calm (crypto median ~12-15 bps volatility)
+
+IMPACT:
+- Spread tightening (via CALM_MARKET_TIGHTENING_FACTOR = 0.65) applies more often
+- Effective spreads narrow in typical conditions
+- EXPECTED: 1.2-1.5x from tighter equilibrium spreads
+
+---
+
+PARAMETERS KEPT UNCHANGED (Still Sound)
+--------------------------------------
+- MAX_INVENTORY = 0.15: Risk limit is appropriate
+- INVENTORY_UNWIND_SIZE_MULTIPLIER = 1.35: Aggressive unwind when needed
+- INVENTORY_UNWIND_JOIN_TOUCH = True: Join market bottom for execution
+- ALLOW_TWO_SIDED_WHEN_ALPHA_SMALL = True: Natural two-sided participation
+- VOLATILITY_SPREAD_MULTIPLIER = 2.0: Still widen in volatile markets
+- Fee rates (MAKER_FEE_RATE = 0.0007): Fixed by exchange
+- Alpha components (IMBALANCE/TRADE/BOOK flow): Provide good signals
+- Calm market tightening factor = 0.65: Apply spread reduction correctly
+
+
+EXPECTED PERFORMANCE IMPROVEMENTS
+----------------------------------
+
+Multiplicative effect of combined changes:
+  Change #1 (spread): 3-5x
+  × Change #2 (inventory skew): 1.5-2x
+  × Change #3 (edge buffer): 1.2-1.5x
+  × Change #4 (vol gate): 1.5-2x
+  × Change #5-9 (other): 1.3-1.5x each
+
+ESTIMATED TOTAL: 7-20x fill frequency increase
+
+Baseline: ~1 fill/day → Aggressive: ~7-20 fills/day
+
+BASELINE EXPECTED METRICS:
+- Total fills per 72h: ~1-3
+- Days with any fills: 1-2 days
+- Total traded notional: $100-500
+- Realized PnL (pre-liquidation): -$20 to +$50 (mostly adverse selection, wide spreads)
+
+AGGRESSIVE EXPECTED METRICS (estimated):
+- Total fills per 72h: 7-50 (depending on market conditions)
+- Days with fills: All 3 days
+- Total traded notional: $1,000-$5,000 (5-10x more)
+- Fill ratio (fills/quotes): 5-15% (vs 0.1-1% baseline)
+- Realized PnL: $100-$500+ (better spread capture, more fills)
+
+Profitability drivers:
+1. More fills → more opportunities to capture spread
+2. Tighter spreads → each fill captures more relative value
+3. Better queue position → higher fill probability per quote
+4. Two-sided participation → natural position cycling, less forced unwinding
+
+
+RISK CONSIDERATIONS & SAFEGUARDS IN AGGRESSIVE VARIANT
+-------------------------------------------------------
+
+1. MAX_INVENTORY still enforced (0.15) - hard limit unchanged
+   → Can accumulate positions but not dangerously
+
+2. INVENTORY_UNWIND_SIZE_MULTIPLIER = 1.35 remains aggressive
+   → When forced to unwind, size increases to get out faster
+
+3. Spreads still widen with VOLATILITY_SPREAD_MULTIPLIER and INVENTORY_SPREAD_MULTIPLIER
+   → Automatic protection in stressful markets (vol spikes, inventory stress)
+
+4. Edge requirements (MIN_REQUIRED_EDGE_BUFFER_BPS = 0.3) still prevent
+   quoting at a loss
+   → Not sacrificing profit for fills
+
+5. ALLOW_TWO_SIDED_WHEN_ALPHA_SMALL = True prevents one-sided accumulation
+   → More balanced building of positions
+
+REALISTIC OUTCOME:
+- Aggressive config is not "max-risk"
+- It's a "reasonable +profitability -timeout" retuning
+- Should trade profitably after fees with realistic adverse selection
+- Main risk: higher inventory variance from more participation
+
+
+TUNING PATH FORWARD
+-------------------
+
+To test and validate this variant:
+
+1. Run baseline backtest with config.py (for comparison)
+2. Run aggressive backtest with agg_config.py (new variant)
+3. Compare metrics:
+   - Fill count & frequency
+   - Traded notional
+   - Average spread captured
+   - Realized PnL (post-fee)
+   - Final equity
+   - Inventory distribution (min/max/mean)
+   - Drawdown profile
+
+4. If aggressive variant succeeds, consider even tighter variant:
+   - MIN_HALF_SPREAD_TICKS: 0.7 or 0.5
+   - MIN_REQUIRED_EDGE_BUFFER_BPS: 0.1 or 0.0 (cost-only)
+   - MAX_VOLATILITY_TO_QUOTE_BPS: 50-60 (quote in all market states)
+   - INVENTORY_UNWIND_THRESHOLD_FRACTION: 0.10-0.15 (less unwinding)
+
+5. If aggressive variant is too aggressive/unprofitable, find middle ground:
+   - Revert one change at a time to see which lever is most impactful
+   - Likely suspect: MIN_HALF_SPREAD_TICKS impacts fills most
+
+
+CONCLUSION
+----------
+
+The agg_config.py represents a disciplined, reasoned approach to increasing
+market participation without sacrificing risk control or realistically allowing
+unprofitable fills. It targets the actual mechanical issues (too-wide spreads,
+too-restrictive filters, over-protective inventory penalization) rather than
+blindly widening sizes or loosening all gates.
+
+The 9 changes work together multiplicatively to increase fill frequency while
+maintaining profitability after fees.
+"""

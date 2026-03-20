@@ -1,8 +1,40 @@
+"""
+Performance metrics computation module.
+
+Computes comprehensive backtest metrics:
+- Returns and Sharpe ratio
+- Drawdown analysis
+- Inventory and trading statistics
+- Fee costs
+- Fill efficiency metrics
+"""
+
 import numpy as np
 import pandas as pd
 
 
 def build_metrics(state_df: pd.DataFrame, fill_df: pd.DataFrame, quote_df: pd.DataFrame, maker_fee_rate: float) -> pd.DataFrame:
+    """
+    Build comprehensive performance metrics from backtest states and fills.
+    
+    Computes:
+    - Time coverage and event counts
+    - Final equity (mark-to-market and liquidation)
+    - PnL (realized and unrealized via inventory liquidation)
+    - Drawdown metrics
+    - Inventory utilization
+    - Trading activity metrics (fill ratio, turnover)
+    - Return statistics (mean, std, Sharpe ratio)
+    
+    Args:
+        state_df (pd.DataFrame): Timeseries of strategy states (inventory, cash, equity)
+        fill_df (pd.DataFrame): Log of all fills executed
+        quote_df (pd.DataFrame): Log of all quote updates
+        maker_fee_rate (float): Maker fee rate for cost calculations
+        
+    Returns:
+        pd.DataFrame: Single row DataFrame with all computed metrics
+    """
     if state_df.empty:
         return pd.DataFrame([{"error": "state_df is empty"}])
 

@@ -1,3 +1,13 @@
+"""
+Feature extraction and computation module.
+
+Computes market microstructure features:
+- Trade flow and intensity
+- Order book flow
+- Volatility (short-term 5s and long-term 60s)
+- Depth and imbalance metrics
+"""
+
 from collections import deque
 from math import log, sqrt
 from typing import Deque, Dict, Tuple
@@ -8,6 +18,20 @@ from utils import EPS, safe_div
 
 
 class FeatureEngine:
+    """
+    Computes market features from order book and trade events.
+    
+    Maintains rolling windows of:
+    - Trade flow (signed volume) and trade counts
+    - Book flow (depth changes on each side)
+    - Absolute returns (for volatility calculation)
+    
+    Computes features like:
+    - Depth and imbalance at various levels
+    - Trade intensity (trades per second)
+    - Volatility (both short and long term)
+    - Microprice edge
+    """
     def __init__(
         self,
         flow_window_ms: int,
@@ -15,6 +39,15 @@ class FeatureEngine:
         volatility_window_ms: int,
         long_vol_window_ms: int,
     ) -> None:
+        """
+        Initialize the feature engine with window sizes.
+        
+        Args:
+            flow_window_ms (int): Rolling window for trade flow (ms)
+            book_flow_window_ms (int): Rolling window for book flow (ms)
+            volatility_window_ms (int): Rolling window for short-term volatility (ms)
+            long_vol_window_ms (int): Rolling window for long-term volatility (ms)
+        """
         self.flow_window_ms = flow_window_ms
         self.book_flow_window_ms = book_flow_window_ms
         self.volatility_window_ms = volatility_window_ms
@@ -30,6 +63,20 @@ class FeatureEngine:
         self.last_mid_ts = None
 
     def update(self, event: MarketEvent, book: LocalOrderBook) -> None:
+        """
+        Update feature engine with a new market event.
+        
+        Processes trades and order book events, adding to rolling windows.
+        Computes log returns for volatility calculation.
+        Purges old data outside rolling windows.
+        
+        Args:
+            event (MarketEvent): Market event to process
+            book (LocalOrderBook): Current order book state
+            
+        Returns:
+            None
+        """
         ts = event.timestampms
 
         if event.action == "TRADE":
@@ -54,6 +101,24 @@ class FeatureEngine:
         self._purge(ts)
 
     def compute(self, timestampms: int, book: LocalOrderBook) -> Dict[str, float]:
+        """
+        Compute current market features from rolling windows.
+        
+        Returns a dictionary with features:
+        - Price levels: best_bid, best_ask, mid, spread, microprice
+        - Depth: depth_bid_1/5, depth_ask_1/5, depth_total_5
+        - Flow: trade_flow_5s, book_flow_5s, trade_intensity_5s
+        - Volatility: volatility_5s_bps, volatility_60s_bps
+        - Imbalance: imbalance_1, imbalance_5
+        - Edge: microprice_edge_bps
+        
+        Args:
+            timestampms (int): Current timestamp (used for window purging)
+            book (LocalOrderBook): Current order book state
+            
+        Returns:
+            Dict[str, float]: Feature dictionary
+        """
         self._purge(timestampms)
 
         best_bid = book.best_bid()
@@ -94,6 +159,15 @@ class FeatureEngine:
         }
 
     def _purge(self, timestampms: int) -> None:
+        """
+        Remove data older than rolling window cutoff times.
+        
+        Args:
+            timestampms (int): Current timestamp
+            
+        Returns:
+            None
+        """
         self._purge_deque(self.trade_flow, timestampms - self.flow_window_ms)
         self._purge_deque(self.trade_counts, timestampms - self.flow_window_ms)
         self._purge_deque(self.book_flow, timestampms - self.book_flow_window_ms)
@@ -102,5 +176,15 @@ class FeatureEngine:
 
     @staticmethod
     def _purge_deque(values: Deque[Tuple[int, float]], cutoff: int) -> None:
+        """
+        Remove elements from deque that are earlier than cutoff timestamp.
+        
+        Args:
+            values (Deque[Tuple[int, float]]): Deque of (timestamp, value) pairs
+            cutoff (int): Cutoff timestamp (remove if timestamp < cutoff)
+            
+        Returns:
+            None (modifies deque in-place)
+        """
         while values and values[0][0] < cutoff:
             values.popleft()

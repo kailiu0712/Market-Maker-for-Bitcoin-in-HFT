@@ -1,3 +1,14 @@
+"""
+Market-making backtest simulator.
+
+Orchestrates the end-to-end backtesting process:
+- Loads market event data
+- Simulates order book and trade events
+- Quotes prices based on fair value and risk management
+- Executes fills and tracks P&L
+- Generates performance metrics
+"""
+
 from typing import Dict, List
 
 import pandas as pd
@@ -14,7 +25,30 @@ from utils import EPS, safe_div
 
 
 class MarketMakingBacktester:
+    """
+    End-to-end market-making backtest simulator.
+    
+    Integrates multiple components:
+    - LocalOrderBook: order book state management
+    - FeatureEngine: market microstructure feature computation
+    - SignalEngine: directional signal generation
+    - RiskManager: inventory-based risk limits
+    - QuoteEngine: quote price and size generation
+    - ExecutionSimulator: fill simulation
+    
+    Processes market events sequentially and logs state at regular intervals.
+    Produces detailed fills, quotes, and state timeseries DataFrames.
+    """
     def __init__(self, config_module) -> None:
+        """
+        Initialize the backtest simulator with configuration.
+        
+        Creates instances of all strategy components and sets up
+        state tracking variables (inventory, cash, P&L).
+        
+        Args:
+            config_module: Configuration module with all strategy parameters
+        """
         self.cfg = config_module
         self.book = LocalOrderBook()
         self.feature_engine = FeatureEngine(
@@ -79,6 +113,25 @@ class MarketMakingBacktester:
         self.state_rows: List[Dict[str, float]] = []
 
     def run(self) -> Dict[str, object]:
+        """
+        Execute the complete backtest.
+        
+        Workflow:
+        1. Inspect and log input data schema
+        2. Stream market events from data file
+        3. Process each event (update book, compute features, generate quotes)
+        4. Track fills and state at regular intervals
+        5. Build performance metrics
+        6. Return comprehensive results
+        
+        Returns:
+            Dict[str, object]: Dictionary with keys:
+                - schema_summary: Input data statistics and structure
+                - state_df: Full state timeseries (inventory, equity, etc.)
+                - fill_df: All fills executed with details
+                - quote_df: All quote refreshes with details
+                - metrics_df: Summary performance metrics
+        """
         schema_summary = inspect_schema(
             csv_path=self.cfg.RAW_EVENT_CSV,
             min_valid_price=self.cfg.MIN_VALID_PRICE,
@@ -124,6 +177,23 @@ class MarketMakingBacktester:
         }
 
     def _process_event(self, event) -> None:
+        """
+        Process a single market event.
+        
+        Steps:
+        1. Update order book if book event
+        2. Simulate fills if trade event
+        3. Compute features if book is valid
+        4. Generate and place quotes at refresh intervals
+        5. Log state at logging intervals
+        6. Report progress
+        
+        Args:
+            event: Market event to process
+            
+        Returns:
+            None
+        """
         self.processed_events += 1
 
         if event.action == "TRADE":
@@ -169,6 +239,21 @@ class MarketMakingBacktester:
             print(f"Processed {self.processed_events:,} events")
 
     def _apply_fill(self, fill: Dict[str, float]) -> None:
+        """
+        Apply a fill to inventory and cash positions.
+        
+        Updates:
+        - Inventory (add/subtract fill size)
+        - Cash (deduct payment + fees / add proceeds - fees)
+        - Average cost (for P&L tracking)
+        - Realized P&L (for closing positions)
+        
+        Args:
+            fill (Dict[str, float]): Fill with quote_side, fill_size, fill_price
+            
+        Returns:
+            None
+        """
         side = fill["quote_side"]
         qty = fill["fill_size"]
         price = fill["fill_price"]
@@ -207,22 +292,66 @@ class MarketMakingBacktester:
         self.trade_count += 1
 
     def _should_refresh_quotes(self, timestampms: int) -> bool:
+        """
+        Check if quotes should be refreshed at this timestamp.
+        
+        Based on QUOTE_REFRESH_MS interval.
+        
+        Args:
+            timestampms (int): Current timestamp
+            
+        Returns:
+            bool: True if refresh due
+        """
         if self.next_quote_refresh_ts is None:
             return True
         return timestampms >= self.next_quote_refresh_ts
 
     def _should_log_state(self, timestampms: int) -> bool:
+        """
+        Check if state should be logged at this timestamp.
+        
+        Based on STATE_LOG_INTERVAL_MS interval.
+        
+        Args:
+            timestampms (int): Current timestamp
+            
+        Returns:
+            bool: True if logging due
+        """
         if self.next_state_log_ts is None:
             return True
         return timestampms >= self.next_state_log_ts
 
     def _log_state(self, timestampms: int, seq: int) -> None:
+        """
+        Log current strategy state snapshot.
+        
+        Captures:
+        - Price levels (best bid/ask, mid)
+        - Positions (inventory, cash, realized P&L)
+        - Equity (mark-to-market and liquidation)
+        - Trading activity (trade count, active quotes)
+        
+        Args:
+            timestampms (int): Timestamp of snapshot
+            seq (int): Event sequence number
+            
+        Returns:
+            None
+        """
         mid = self.book.mid_price() or 0.0
         best_bid = self.book.best_bid() or 0.0
         best_ask = self.book.best_ask() or 0.0
         equity_mtm = self.cash + self.inventory * mid
         liquidation_price = best_bid if self.inventory > 0 else best_ask if self.inventory < 0 else mid
         equity_liquidation = self.cash + self.inventory * liquidation_price - abs(self.inventory) * liquidation_price * self.cfg.LIQUIDATION_FEE_RATE
+        total_pnl_mtm = equity_mtm - float(self.cfg.INITIAL_CASH)
+        total_pnl_liquidation = equity_liquidation - float(self.cfg.INITIAL_CASH)
+        # Realized PnL only tracks closed-position price differences in this model.
+        # The remaining mark-to-market contribution, including open-position fees,
+        # belongs in unrealized PnL so realized + unrealized = total PnL.
+        unrealized_pnl = total_pnl_mtm - self.realized_pnl
 
         self.state_rows.append(
             {
@@ -235,8 +364,11 @@ class MarketMakingBacktester:
                 "cash": self.cash,
                 "avg_cost": self.avg_cost,
                 "realized_pnl": self.realized_pnl,
+                "unrealized_pnl": unrealized_pnl,
                 "equity_mtm": equity_mtm,
                 "equity_liquidation": equity_liquidation,
+                "total_pnl_mtm": total_pnl_mtm,
+                "total_pnl_liquidation": total_pnl_liquidation,
                 "trade_count": self.trade_count,
                 "bid_quote_price": None if self.execution_simulator.bid_quote is None else self.execution_simulator.bid_quote.price,
                 "ask_quote_price": None if self.execution_simulator.ask_quote is None else self.execution_simulator.ask_quote.price,

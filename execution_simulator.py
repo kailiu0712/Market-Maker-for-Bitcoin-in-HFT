@@ -1,3 +1,13 @@
+"""
+Execution simulation and fill model module.
+
+Simulates order book matching and fills:
+- Tracks posted quotes (bid and ask)
+- Manages queue position for limit orders
+- Simulates trade fills based on fill probability model
+- Logs all quote activities and fills
+"""
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -7,6 +17,19 @@ from order_book import LocalOrderBook
 
 @dataclass
 class WorkingQuote:
+    """
+    Represents a posted market-making quote.
+    
+    Attributes:
+        side (str): "BID" or "ASK"
+        price (float): Posted quote price
+        size (float): Original order size
+        remaining_size (float): Current remaining quantity
+        queue_ahead (float): Estimated quantity ahead in queue
+        posted_ts (int): Timestamp when quote was posted
+        posted_seq (int): Event sequence when quote was posted
+        active (bool): Whether quote is still active (not fully filled)
+    """
     side: str
     price: float
     size: float
@@ -18,6 +41,19 @@ class WorkingQuote:
 
 
 class ExecutionSimulator:
+    """
+    Simulates order execution and fill generation.
+    
+    Maintains working quotes and processes trades:
+    - Tracks active bid and ask quotes
+    - Processes incoming trades to generate fills
+    - Updates queue position based on order book events
+    - Logs all quote events and fills
+    
+    Uses configurable fill probabilities:
+    - touch_fill_fraction: probability of fill at our posted price
+    - improved_price_fill_fraction: probability of fill at better prices
+    """
     def __init__(
         self,
         touch_fill_fraction: float,
@@ -27,6 +63,17 @@ class ExecutionSimulator:
         quote_reprice_threshold_ticks: float,
         quote_max_age_ms: int,
     ) -> None:
+        """
+        Initialize the execution simulator.
+        
+        Args:
+            touch_fill_fraction (float): Probability of fill at touch (our price)
+            improved_price_fill_fraction (float): Probability of fill at better prices
+            min_fill_size (float): Minimum size to record as fill
+            price_tick (float): Price grid granularity
+            quote_reprice_threshold_ticks (float): Price move before forced reprice
+            quote_max_age_ms (int): Max age before quote must refresh
+        """
         self.touch_fill_fraction = touch_fill_fraction
         self.improved_price_fill_fraction = improved_price_fill_fraction
         self.min_fill_size = min_fill_size
@@ -39,10 +86,43 @@ class ExecutionSimulator:
         self.fill_log: List[Dict[str, float]] = []
 
     def refresh_quotes(self, timestampms: int, seq: int, book: LocalOrderBook, quote_target, inventory: float) -> None:
+        """
+        Update working quotes based on new quote targets.
+        
+        Refreshes bid and ask quotes if:
+        - No existing quote
+        - Price change exceeds reprice threshold
+        - Quote has aged beyond max age
+        - Size has changed significantly
+        
+        Otherwise keeps existing quote to maintain queue position.
+        
+        Args:
+            timestampms (int): Current timestamp
+            seq (int): Event sequence number
+            book (LocalOrderBook): Current order book state
+            quote_target: Target quote with new bid/ask prices and sizes
+            inventory (float): Current inventory position
+            
+        Returns:
+            None
+        """
         self.bid_quote = self._refresh_one_quote(self.bid_quote, "BID", quote_target.bid_price, quote_target.bid_size, timestampms, seq, book, inventory, quote_target)
         self.ask_quote = self._refresh_one_quote(self.ask_quote, "ASK", quote_target.ask_price, quote_target.ask_size, timestampms, seq, book, inventory, quote_target)
 
     def process_event(self, event: MarketEvent) -> List[Dict[str, float]]:
+        """
+        Process a market event and generate fills if applicable.
+        
+        For TRADE events: Check if our quotes match and simulate fills.
+        For CANCEL/FILL_UPDATE: Update queue position.
+        
+        Args:
+            event (MarketEvent): Market event to process
+            
+        Returns:
+            List[Dict[str, float]]: List of fills (may be empty)
+        """
         fills: List[Dict[str, float]] = []
         if event.action == "TRADE":
             fill = self._process_trade(event)
@@ -118,6 +198,24 @@ class ExecutionSimulator:
         return quote
 
     def _process_trade(self, event: MarketEvent) -> Optional[Dict[str, float]]:
+        """
+        Process a trade event and simulate fill against our quote.
+        
+        Generates fill only if:
+        1. We have an active quote on the passive side
+        2. Trade price matches our quote (at touch) or better (improved)
+        3. Trade size allows for partial fill after queue ahead
+        
+        Uses different fill fractions for:
+        - Touch (our price): lower fill probability (lower priority)
+        - Improved (better price): higher fill probability (we're favored)
+        
+        Args:
+            event (MarketEvent): Trade event
+            
+        Returns:
+            Optional[Dict[str, float]]: Fill details or None if no fill
+        """
         passive_side = event.passive_side
         if passive_side == "BID":
             quote = self.bid_quote
@@ -160,6 +258,18 @@ class ExecutionSimulator:
         }
 
     def _update_queue_ahead(self, event: MarketEvent) -> None:
+        """
+        Update queue position for working quotes.
+        
+        When market orders are cancelled or partially filled on the same side
+        and price as our quote, our queue position improves.
+        
+        Args:
+            event (MarketEvent): CANCEL or FILL_UPDATE event
+            
+        Returns:
+            None
+        """
         for quote in (self.bid_quote, self.ask_quote):
             if quote is None or not quote.active:
                 continue

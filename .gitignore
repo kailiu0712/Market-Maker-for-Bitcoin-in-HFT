@@ -1,1 +1,9 @@
+# Large input datasets
 input/gemini_24h_analysis.csv
+input/*.parquet
+
+# Generated outputs
+output/*.csv
+output/*.pdf
+output/*.png
+output/*.json
